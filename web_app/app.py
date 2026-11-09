@@ -24,15 +24,7 @@ app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # Límite máximo: 15 MB
 ALLOWED_EXTENSIONS = {"wav", "mp3", "ogg", "flac"}
 
 # Configuración CORS: Permite peticiones desde tu sitio en Netlify y en local
-CORS(app, resources={
-    r"/api/*": {
-        "origins": [
-            "https://dat255.netlify.app",
-            "http://localhost:*",
-            "http://127.0.0.1:*"
-        ]
-    }
-})
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=False)
 
 BUNDLE_DIR = os.path.join(CURRENT_DIR, "models_bundle")
 TEMP_AUDIO_DIR = os.path.join(CURRENT_DIR, "temp_audio")
@@ -85,7 +77,8 @@ def analyze_audio():
         return jsonify({"error": "Formato de archivo no válido (Use .wav, .mp3 o .ogg)"}), 400
 
     try:
-        y, sr = librosa.load(file, sr=22050, mono=True)
+        # Carga optimizada: límite representativo de 30 segundos para evitar saturación de RAM y timeouts
+        y, sr = librosa.load(file, sr=22050, mono=True, duration=30.0)
         y, _ = librosa.effects.trim(y, top_db=25)
     except Exception as e:
         return jsonify({"error": f"Error decodificando audio: {str(e)}"}), 400
@@ -127,6 +120,12 @@ def analyze_audio():
         if starts[-1] + window_size < total_samples:
             starts.append(total_samples - window_size)
 
+        # Optimización de concurrencia: límite a máx 12 ventanas distribuidas uniformemente
+        MAX_WINDOWS = 12
+        if len(starts) > MAX_WINDOWS:
+            indices = np.linspace(0, len(starts) - 1, MAX_WINDOWS, dtype=int)
+            starts = [starts[i] for i in indices]
+
         for st in starts:
             chunk = y[st : st + window_size]
             c_feat, _, _, _ = extract_71_audio_features(chunk, sr)
@@ -163,14 +162,20 @@ def analyze_audio():
     })
 
 
+@app.route("/api/audio_stream/<track_type>", defaults={"session_id": None})
 @app.route("/api/audio_stream/<session_id>/<track_type>")
 def audio_stream(session_id, track_type):
-    clean_id = "".join([c for c in session_id if c.isalnum() or c == "-"])
-    fname = f"{clean_id}_harmonic.wav" if track_type == "harmonic" else f"{clean_id}_percussive.wav"
-    fpath = os.path.join(TEMP_AUDIO_DIR, fname)
-
-    if not os.path.exists(fpath):
-        return jsonify({"error": "Pista expirada o no encontrada"}), 404
+    if session_id is None:
+        files = glob.glob(os.path.join(TEMP_AUDIO_DIR, f"*_{track_type}.wav"))
+        if not files:
+            return jsonify({"error": "Pista no encontrada"}), 404
+        fpath = max(files, key=os.path.getmtime)
+    else:
+        clean_id = "".join([c for c in session_id if c.isalnum() or c == "-"])
+        fname = f"{clean_id}_harmonic.wav" if track_type == "harmonic" else f"{clean_id}_percussive.wav"
+        fpath = os.path.join(TEMP_AUDIO_DIR, fname)
+        if not os.path.exists(fpath):
+            return jsonify({"error": "Pista expirada o no encontrada"}), 404
 
     es_descarga = request.args.get("download", "false").lower() == "true"
     nombre_descarga = "Pista_Armonica.wav" if track_type == "harmonic" else "Pista_Percusiva.wav"
