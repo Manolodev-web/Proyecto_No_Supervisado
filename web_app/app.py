@@ -1,191 +1,158 @@
 import os
+import glob
+import time
+import uuid
 import joblib
 import librosa
 import numpy as np
 import soundfile as sf
 from flask import Flask, jsonify, render_template, request, send_file
 
-app = Flask(__name__)
+from audio_features import extract_71_audio_features, NOTAS_CQT
 
-# ==============================================================================
-# Configuración de Rutas y Carga de Modelos Serializados
-# ==============================================================================
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # Límite 15 MB
+ALLOWED_EXTENSIONS = {"wav", "mp3", "ogg", "flac"}
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BUNDLE_DIR = os.path.join(BASE_DIR, "models_bundle")
 TEMP_AUDIO_DIR = os.path.join(BASE_DIR, "temp_audio")
 os.makedirs(TEMP_AUDIO_DIR, exist_ok=True)
 
-# Cargar artefactos entrenados
+# Cargar artefactos preentrenados en memoria una sola vez al arranque
 scaler = joblib.load(os.path.join(BUNDLE_DIR, "scaler.joblib"))
 pca_15d = joblib.load(os.path.join(BUNDLE_DIR, "pca_15d.joblib"))
 pca_2d = joblib.load(os.path.join(BUNDLE_DIR, "pca_2d.joblib"))
 gmm_model = joblib.load(os.path.join(BUNDLE_DIR, "gmm_model.joblib"))
+kmeans_model = joblib.load(os.path.join(BUNDLE_DIR, "kmeans_model.joblib"))
 cluster_mapping = joblib.load(os.path.join(BUNDLE_DIR, "cluster_mapping.joblib"))
 
-# Cargar K-Means si está disponible en el bundle
-kmeans_model_path = os.path.join(BUNDLE_DIR, "kmeans_model.joblib")
-kmeans_mapping_path = os.path.join(BUNDLE_DIR, "kmeans_mapping.joblib")
-kmeans_model = joblib.load(kmeans_model_path) if os.path.exists(kmeans_model_path) else None
-kmeans_mapping = joblib.load(kmeans_mapping_path) if os.path.exists(kmeans_mapping_path) else cluster_mapping
 
-NOTAS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# ==============================================================================
-# Función Auxiliar: Extracción de 71 Variables Físicas por Segmento
-# ==============================================================================
-def extract_segment_features(y_seg, sr):
-    # A) Separación HPSS local
-    y_harm, y_perc = librosa.effects.hpss(y_seg)
-    e_harm = float(np.sum(y_harm**2))
-    e_perc = float(np.sum(y_perc**2))
-    hpss_ratio = (e_perc - e_harm) / (e_perc + e_harm + 1e-9)
 
-    # B) Cromagrama CQT (12 semitonos)
-    chroma_cqt = librosa.feature.chroma_cqt(y=y_harm, sr=sr, n_chroma=12)
-    chroma_mean = np.mean(chroma_cqt, axis=1)
-    chroma_std = np.std(chroma_cqt, axis=1)
+def purge_old_temp_files(max_age_seconds=600):
+    """Elimina audios temporales con más de 10 minutos de antigüedad."""
+    now = time.time()
+    for f in glob.glob(os.path.join(TEMP_AUDIO_DIR, "*.wav")):
+        try:
+            if os.stat(f).st_mtime < now - max_age_seconds:
+                os.remove(f)
+        except OSError:
+            pass
 
-    # C) MFCCs (13 coeficientes)
-    mfcc = librosa.feature.mfcc(y=y_seg, sr=sr, n_mfcc=13)
-    mfcc_mean = np.mean(mfcc, axis=1)
-    mfcc_std = np.std(mfcc, axis=1)
 
-    # D) Contraste Espectral (7 bandas)
-    contrast = librosa.feature.spectral_contrast(y=y_seg, sr=sr, n_bands=6)
-    contrast_mean = np.mean(contrast, axis=1)
-    contrast_std = np.std(contrast, axis=1)
-
-    # E) Descriptores Espectrales
-    centroid = librosa.feature.spectral_centroid(y=y_seg, sr=sr)
-    rolloff = librosa.feature.spectral_rolloff(y=y_seg, sr=sr, roll_percent=0.85)
-    zcr = librosa.feature.zero_crossing_rate(y_seg)
-
-    vec = np.hstack([
-        mfcc_mean,                     # 13
-        mfcc_std,                      # 13
-        chroma_mean,                   # 12
-        chroma_std,                    # 12
-        contrast_mean,                 # 7
-        contrast_std,                  # 7
-        np.mean(centroid), np.std(centroid),    # 2
-        np.mean(rolloff), np.std(rolloff),      # 2
-        np.mean(zcr), np.std(zcr),              # 2
-        hpss_ratio                              # 1
-    ])
-    return vec, chroma_mean
-
-# ==============================================================================
-# Rutas y Endpoints
-# ==============================================================================
 @app.route("/")
 def index():
     return render_template("index.html")
 
+
 @app.route("/api/analyze_audio", methods=["POST"])
 def analyze_audio():
+    purge_old_temp_files()
+
     if "audio_file" not in request.files:
         return jsonify({"error": "No se subió ningún archivo de audio"}), 400
 
     file = request.files["audio_file"]
-    if file.filename == "":
-        return jsonify({"error": "Nombre de archivo vacío"}), 400
+    if file.filename == "" or not allowed_file(file.filename):
+        return jsonify({"error": "Formato no válido. Use .wav, .mp3 o .ogg"}), 400
 
-    # 1. Cargar señal y recortar silencios extremos
-    y, sr = librosa.load(file, sr=22050, mono=True)
-    y, _ = librosa.effects.trim(y, top_db=25)
+    try:
+        y, sr = librosa.load(file, sr=22050, mono=True)
+        y, _ = librosa.effects.trim(y, top_db=25)
+    except Exception as e:
+        return jsonify({"error": f"Error decodificando audio: {str(e)}"}), 400
+
     total_samples = len(y)
+    if total_samples < sr * 0.3:
+        return jsonify({"error": "Audio demasiado corto (mínimo 300 ms)"}), 400
 
-    if total_samples < sr * 0.4:
-        return jsonify({"error": "El audio es demasiado corto (mínimo 400 ms)"}), 400
+    # 1. Extracción física global de 71 dimensiones
+    feats_global, chroma_global, y_harm, y_perc = extract_71_audio_features(y, sr)
 
-    # 2. Separación HPSS global para streaming y descarga
-    y_harm, y_perc = librosa.effects.hpss(y)
-    harm_path = os.path.join(TEMP_AUDIO_DIR, "current_harmonic.wav")
-    perc_path = os.path.join(TEMP_AUDIO_DIR, "current_percussive.wav")
-    sf.write(harm_path, y_harm, sr)
-    sf.write(perc_path, y_perc, sr)
+    # 2. Guardar pistas temporales aisladas por sesión UUID
+    session_id = str(uuid.uuid4())
+    harm_filename = f"{session_id}_harmonic.wav"
+    perc_filename = f"{session_id}_percussive.wav"
+    sf.write(os.path.join(TEMP_AUDIO_DIR, harm_filename), y_harm, sr)
+    sf.write(os.path.join(TEMP_AUDIO_DIR, perc_filename), y_perc, sr)
 
-    # 3. Perfil de notas global con CQT
-    chroma_global = librosa.feature.chroma_cqt(y=y_harm, sr=sr, n_chroma=12)
-    chroma_vector = np.mean(chroma_global, axis=1)
-    indices_notas = np.argsort(chroma_vector)[::-1][:3]
-    top_notas = [f"{NOTAS[idx]} ({chroma_vector[idx]:.2f})" for idx in indices_notas]
+    # 3. Inferencia global sobre espacio latente (15D PCA)
+    x_scaled = scaler.transform(feats_global.reshape(1, -1))
+    x_15d = pca_15d.transform(x_scaled)
+    x_2d = pca_2d.transform(x_scaled)[0]
 
-    # 4. Análisis Temporal Ventana por Ventana (Chunking de 1.5s, solape 0.75s)
-    # Evita que el promedio global sature la probabilidad al 100%
+    probs_gmm = gmm_model.predict_proba(x_15d)[0]
+    c_gmm = int(np.argmax(probs_gmm))
+    c_km = int(kmeans_model.predict(x_15d)[0])
+    inst_pred = cluster_mapping.get(c_gmm, f"Clúster {c_gmm}")
+    confianza = round(float(np.max(probs_gmm)) * 100, 2)
+
+    # 4. Análisis dinámico temporal por ventanas
     window_size = int(sr * 1.5)
     hop_size = int(sr * 0.75)
-
-    timeline_preds = []
+    timeline_clusters = []
 
     if total_samples <= window_size:
-        # Si el audio dura menos de 1.5s se analiza entero
-        feat_chunk, _ = extract_segment_features(y, sr)
-        x_scaled = scaler.transform(feat_chunk.reshape(1, -1))
-        x_15d = pca_15d.transform(x_scaled)
-        pred_c = int(gmm_model.predict(x_15d)[0])
-        timeline_preds.append(pred_c)
+        timeline_clusters.append(c_gmm)
     else:
-        for start in range(0, total_samples - window_size, hop_size):
-            chunk = y[start : start + window_size]
-            feat_chunk, _ = extract_segment_features(chunk, sr)
-            x_scaled = scaler.transform(feat_chunk.reshape(1, -1))
-            x_15d = pca_15d.transform(x_scaled)
-            pred_c = int(gmm_model.predict(x_15d)[0])
-            timeline_preds.append(pred_c)
+        starts = list(range(0, total_samples - window_size, hop_size))
+        if starts[-1] + window_size < total_samples:
+            starts.append(total_samples - window_size)
 
-    # 5. Cálculo de Distribución de Pertenencia Real (% de tiempo activo)
-    n_chunks = max(len(timeline_preds), 1)
-    counts = {i: timeline_preds.count(i) for i in range(4)}
+        for st in starts:
+            chunk = y[st : st + window_size]
+            c_feat, _, _, _ = extract_71_audio_features(chunk, sr)
+            c_15d = pca_15d.transform(scaler.transform(c_feat.reshape(1, -1)))
+            timeline_clusters.append(int(gmm_model.predict(c_15d)[0]))
 
-    # Determinar instrumento predominante en la pista
-    predominante_id = max(counts, key=counts.get)
-    instrumento_final = cluster_mapping.get(predominante_id, f"Clúster {predominante_id}")
-    certidumbre = round((counts[predominante_id] / n_chunks) * 100, 1)
-
+    n_chunks = len(timeline_clusters)
     distribucion = {}
-    for c_id in range(4):
-        label_name = cluster_mapping.get(c_id, f"Clúster {c_id}")
-        pct = round((counts[c_id] / n_chunks) * 100, 1)
-        distribucion[f"{label_name} (C{c_id})"] = pct
+    for c_id in sorted(cluster_mapping.keys()):
+        inst_name = cluster_mapping[c_id]
+        pct = round((timeline_clusters.count(c_id) / n_chunks) * 100, 1)
+        distribucion[f"{inst_name} (C{c_id})"] = pct
 
-    # 6. Proyección 2D para visualización del centro de masa de la pista
-    feat_global, _ = extract_segment_features(y, sr)
-    x_global_scaled = scaler.transform(feat_global.reshape(1, -1))
-    x_2d = pca_2d.transform(x_global_scaled)[0]
+    # Notas CQT
+    top_idxs = np.argsort(chroma_global)[::-1][:3]
+    top_notas = [f"{NOTAS_CQT[i]} ({chroma_global[i]:.2f})" for i in top_idxs]
 
     return jsonify({
-        "instrumento": instrumento_final,
-        "cluster_id": predominante_id,
-        "certidumbre": certidumbre,
+        "session_id": session_id,
+        "instrumento": inst_pred,
+        "cluster_id": c_gmm,
+        "cluster_kmeans": c_km,
+        "certidumbre": confianza,
         "distribucion_probabilidad": distribucion,
         "proyeccion_2d": {
             "pc1": round(float(x_2d[0]), 3),
             "pc2": round(float(x_2d[1]), 3)
         },
         "notas_cqt": {
-            "labels": NOTAS,
-            "valores": [round(float(v), 3) for v in chroma_vector],
+            "labels": NOTAS_CQT,
+            "valores": [round(float(v), 3) for v in chroma_global],
             "top_detectadas": top_notas
         }
     })
 
-@app.route("/api/audio_stream/<track_type>")
-def audio_stream(track_type):
-    fname = "current_harmonic.wav" if track_type == "harmonic" else "current_percussive.wav"
+
+@app.route("/api/audio_stream/<session_id>/<track_type>")
+def audio_stream(session_id, track_type):
+    clean_id = "".join([c for c in session_id if c.isalnum() or c == "-"])
+    fname = f"{clean_id}_harmonic.wav" if track_type == "harmonic" else f"{clean_id}_percussive.wav"
     fpath = os.path.join(TEMP_AUDIO_DIR, fname)
+
     if not os.path.exists(fpath):
-        return jsonify({"error": "Pista no disponible"}), 404
+        return jsonify({"error": "Pista no disponible o expirada"}), 404
 
     es_descarga = request.args.get("download", "false").lower() == "true"
     nombre_descarga = "Pista_Armonica.wav" if track_type == "harmonic" else "Pista_Percusiva.wav"
 
-    return send_file(
-        fpath,
-        mimetype="audio/wav",
-        as_attachment=es_descarga,
-        download_name=nombre_descarga
-    )
+    return send_file(fpath, mimetype="audio/wav", as_attachment=es_descarga, download_name=nombre_descarga)
+
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
