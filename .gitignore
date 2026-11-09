@@ -1,0 +1,65 @@
+# ==============================================================================
+# 1. Entornos Virtuales de Python
+# ==============================================================================
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==============================================================================
+# 2. Archivos Compilados y Caché de Python
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+*.ipynb_checkpoints
+
+# ==============================================================================
+# 3. Archivos Comprimidos y Respaldos Pesados
+# ==============================================================================
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+archive.zip
+
+# ==============================================================================
+# 4. Datos de Audio Masivos (~3 GB)
+# ==============================================================================
+00_data/raw/Train_submission/
+00_data/raw/Test_submission/
+*.wav
+*.mp3
+*.ogg
+*.flac
+*.m4a
+
+# Excepción: Conservar la muestra ligera de prueba para inferencia
+!04_inference/custom_audio/*.wav
+
+# ==============================================================================
+# 5. Archivos Temporales y Caché de la Web (Flask)
+# ==============================================================================
+web_app/temp_audio/
+*.tmp
+chicago_taxi_cache.csv
+
+# ==============================================================================
+# 6. Editores de Código y Sistema Operativo
+# ==============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
